@@ -10,7 +10,6 @@ const { chromium } = require(playwrightPath);
 const baseURL = process.env.HANDBOOK_BASE_URL || 'http://127.0.0.1:4387';
 const book = loadHandbook();
 const chapterURL = id => `${baseURL}/#/chapter/${id}`;
-const MIN_TOUCH_TARGET = 44;
 
 async function checkChapters(page) {
   for (const chapter of book.chapters) {
@@ -163,6 +162,116 @@ async function readVisibleBoxes(locator, { excludeAriaHidden = false } = {}) {
   return boxes.filter(box => box.display !== 'none' && box.visibility !== 'hidden' && box.width > 0 && box.height > 0 && (!excludeAriaHidden || !box.ariaHidden));
 }
 
+async function readTokenPx(page, token) {
+  return page.evaluate(token => {
+    const probe = document.createElement('span');
+    probe.style.cssText = `position:absolute;visibility:hidden;font-size:var(${token})`;
+    document.body.append(probe);
+    const value = parseFloat(getComputedStyle(probe).fontSize);
+    probe.remove();
+    return value;
+  }, token);
+}
+
+
+async function assertMinimumTextSize(page, label) {
+  const minimum = await readTokenPx(page, '--text-caption');
+  const violations = await page.evaluate(minimum => {
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    const found = [];
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      if (!node.textContent.trim()) continue;
+      const element = node.parentElement;
+      if (!element || element.closest('svg, [hidden], .handbook-skip')) continue;
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      if (style.display === 'none' || style.visibility === 'hidden' || rect.width === 0 || rect.height === 0) continue;
+      const size = parseFloat(style.fontSize);
+      if (size < minimum) found.push({ text: node.textContent.trim().slice(0, 30), size, className: String(element.className) });
+    }
+    return found;
+  }, minimum);
+  assert.deepEqual(violations, [], `${label}：存在小于 ${minimum}px 的可见文字`);
+}
+
+const READING_SELECTORS = [
+  '.lesson-header > p',
+  '.lesson-concepts p',
+  '.lesson-interview details p',
+  '.handbook-note-card > p',
+  '.handbook-about-copy',
+  '.handbook-hero-copy > p',
+  '.handbook-page-heading > p:last-child'
+];
+
+async function assertReadingTypography(page, label) {
+  const settings = await page.evaluate(() => {
+    const read = token => {
+      const probe = document.createElement('span');
+      probe.style.cssText = `position:absolute;visibility:hidden;font-size:var(${token})`;
+      document.body.append(probe);
+      const value = parseFloat(getComputedStyle(probe).fontSize);
+      probe.remove();
+      return value;
+    };
+    const measureProbe = document.createElement('span');
+    measureProbe.style.cssText = 'position:absolute;visibility:hidden;display:block;height:1px;width:var(--reading-measure)';
+    document.body.append(measureProbe);
+    const measure = parseFloat(getComputedStyle(measureProbe).width);
+    measureProbe.remove();
+    return {
+      expectedSize: matchMedia('(max-width: 900px)').matches ? read('--text-reading-mobile') : read('--text-reading'),
+      measure
+    };
+  });
+  for (const selector of READING_SELECTORS) {
+    const locator = page.locator(selector);
+    if (await locator.count() === 0) continue;
+    const metrics = await locator.evaluateAll(elements => elements
+      .filter(element => {
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0 && !element.closest('[aria-hidden="true"]');
+      })
+      .map(element => {
+        const style = getComputedStyle(element);
+        return { fontSize: parseFloat(style.fontSize), lineHeight: parseFloat(style.lineHeight), textAlign: style.textAlign, width: element.getBoundingClientRect().width };
+      }));
+    for (const metric of metrics) {
+      assert.equal(metric.fontSize, settings.expectedSize, `${label}：${selector} 需要 ${settings.expectedSize}px`);
+      assert.ok(metric.textAlign === 'left' || metric.textAlign === 'start', `${label}：${selector} 应左对齐`);
+      assert.ok(metric.width <= settings.measure + 0.5, `${label}：${selector} 行长超过 ${settings.measure}px`);
+      assert.ok(Math.abs(metric.lineHeight / metric.fontSize - 1.9) < 0.05, `${label}：${selector} 行高应约为 1.9`);
+    }
+  }
+}
+
+async function assertFontStacks(page) {
+  const fonts = await page.evaluate(() => {
+    const style = getComputedStyle(document.documentElement);
+    let fontFaces = 0;
+    for (const sheet of document.styleSheets) {
+      try { fontFaces += Array.from(sheet.cssRules).filter(rule => rule.type === CSSRule.FONT_FACE_RULE).length; } catch (error) { /* 跨域样式表不参与本地检查。 */ }
+    }
+    const fontResources = performance.getEntriesByType('resource').filter(entry => /\.(woff2?|ttf|otf)(\?|$)/i.test(entry.name)).map(entry => entry.name);
+    return {
+      sans: style.getPropertyValue('--handbook-sans'),
+      serif: style.getPropertyValue('--handbook-serif'),
+      hand: style.getPropertyValue('--handbook-hand'),
+      mono: style.getPropertyValue('--handbook-mono'),
+      fontFaces,
+      fontResources
+    };
+  });
+  assert.ok(fonts.sans.trim().startsWith('"PingFang SC"'), '无衬线字体栈未优先 PingFang SC');
+  assert.ok(fonts.serif.trim().startsWith('"Songti SC"'), '衬线字体栈未优先 Songti SC');
+  assert.ok(fonts.hand.includes('Kaiti SC') && fonts.hand.includes('KaiTi'), '手写字体栈缺少楷体回退');
+  assert.ok(fonts.mono.includes('Cascadia Code') && fonts.mono.includes('Menlo'), '等宽字体栈缺少回退');
+  assert.equal(fonts.fontFaces, 0, '不应声明 @font-face');
+  assert.deepEqual(fonts.fontResources, [], '不应下载字体资源');
+}
+
 async function assertChapterStructure(page, chapter, label = chapter.id) {
   assert.equal(await page.locator('.lesson-flow-node').count(), 4, label);
   assert.equal(await page.locator('.lesson-task').count(), 3, label);
@@ -192,14 +301,15 @@ async function measureTopbar(page) {
 }
 
 async function assertTouchTargets(page, selectors, label) {
+  const minimum = await readTokenPx(page, '--handbook-touch-target');
   for (const selector of selectors) {
     const locator = page.locator(selector);
     await locator.first().waitFor({ state: 'visible' });
     const sizes = await readVisibleBoxes(locator, { excludeAriaHidden: true });
     assert.ok(sizes.length, `${label}：未找到触控目标 ${selector}`);
     for (const size of sizes) {
-      assert.ok(size.width >= MIN_TOUCH_TARGET - 0.5, `${label}：${selector}「${size.text}」宽度 ${size.width}px 小于 44px`);
-      assert.ok(size.height >= MIN_TOUCH_TARGET - 0.5, `${label}：${selector}「${size.text}」高度 ${size.height}px 小于 44px`);
+      assert.ok(size.width >= minimum - 0.5, `${label}：${selector}「${size.text}」宽度 ${size.width}px 小于 ${minimum}px`);
+      assert.ok(size.height >= minimum - 0.5, `${label}：${selector}「${size.text}」高度 ${size.height}px 小于 ${minimum}px`);
     }
   }
 }
@@ -211,6 +321,8 @@ async function checkResponsive(page) {
       await page.goto(`${baseURL}${route}`);
       await page.locator('h1').waitFor();
       await assertNoPageOverflow(page, `${width} ${name}`);
+      await assertMinimumTextSize(page, `${width} ${name}`);
+      await assertReadingTypography(page, `${width} ${name}`);
       const topbar = await measureTopbar(page);
       for (let index = 0; index < topbar.boxes.length - 1; index += 1) {
         assert.ok(topbar.boxes[index].right <= topbar.boxes[index + 1].left + 1, `${width} ${name}：顶部导航内容重叠`);
@@ -225,7 +337,15 @@ async function checkResponsive(page) {
       }
     }
   }
-  console.log('通过：320 / 375 / 390 / 430 / 768 / 1024 / 1440 视口与首页、章节、搜索、笔记、资料、说明页无横向溢出、导航不重叠');
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto(baseURL);
+  await page.locator('h1').waitFor();
+  await assertFontStacks(page);
+  await page.goto(chapterURL('rag-indexes'));
+  await page.locator('h1').waitFor();
+  const tocFontSize = await page.locator('.lesson-toc > a').first().evaluate(element => parseFloat(getComputedStyle(element).fontSize));
+  assert.equal(tocFontSize, await readTokenPx(page, '--text-ui'), '桌面本章目录应使用 ui 字号');
+  console.log('通过：320 / 375 / 390 / 430 / 768 / 1024 / 1440 视口、最小字号、阅读宽度、字体栈与桌面目录字号');
 }
 
 async function checkMobileTouchTargets(page) {
@@ -303,7 +423,8 @@ async function checkMobileFeedbackBounds(page) {
     return { left: rect.left, right: rect.right, buttons };
   });
   assert.ok(preview.left >= 0 && preview.right <= 320, '320：导入预览超出屏幕');
-  assert.ok(preview.buttons.every(size => size.width >= MIN_TOUCH_TARGET - 0.5 && size.height >= MIN_TOUCH_TARGET - 0.5), '320：导入预览按钮尺寸不足');
+  const minimumTouch = await readTokenPx(page, '--handbook-touch-target');
+  assert.ok(preview.buttons.every(size => size.width >= minimumTouch - 0.5 && size.height >= minimumTouch - 0.5), '320：导入预览按钮尺寸不足');
   await page.getByRole('button', { name: '取消', exact: true }).click();
   assert.equal(await page.locator('.handbook-import-preview').count(), 0);
   await uploadInvalidBackup(page);
